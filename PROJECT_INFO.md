@@ -19,13 +19,11 @@ udpxyscan/
 ├── build_test.sh          # Linux构建脚本
 ├── test_suite.bat         # 自动化测试脚本
 ├── dev_tools.bat          # 开发者工具
-├── .vscode/               # VS Code配置
-│   ├── tasks.json         # 构建任务
-│   ├── launch.json        # 调试配置
-│   ├── settings.json      # 编辑器设置
-│   └── extensions.json    # 推荐扩展
-└── .github/
-    └── copilot-instructions.md  # Copilot指令
+└── .vscode/               # VS Code配置
+    ├── tasks.json         # 构建任务
+    ├── launch.json        # 调试配置
+    ├── settings.json      # 编辑器设置
+    └── extensions.json    # 推荐扩展
 ```
 
 ## 技术特性
@@ -64,7 +62,7 @@ udpxyscan/
 - [x] 参数解析验证
 - [x] UDPXY服务检测
 - [x] 网段和范围扫描
-- [ ] SYN扫描 (需要管理员权限)
+- [x] SYN扫描 (需要管理员权限)
 - [ ] 性能压力测试
 - [ ] 大规模网络扫描
 
@@ -86,4 +84,4 @@ udpxyscan/
 MIT License - 开源自由使用
 
 ## 作者
-开发者工具生成 - 2024
+vitter - 2025
