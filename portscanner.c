@@ -94,6 +94,8 @@ typedef struct
     char outfile[256];
     scan_mode_t scan_mode; // 扫描模式
     int udpxy_detect;      // 是否进行UDPXY检测
+    uint32_t syn_seq;      // SYN包的序列号（仅SYN扫描用）
+    int status;            // 端口状态（0=未判定, 1=开放, 2=关闭, 3=过滤）
 } scan_task_t;
 
 // 任务队列结构
@@ -130,6 +132,16 @@ static volatile int udpxy_services_found = 0;
 static pthread_mutex_t output_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int raw_socket_fd = -1; // 原始套接字
 
+// SYN扫描任务列表及互斥锁（用于收包线程判定）
+#define MAX_SYN_TASKS 10000
+static scan_task_t *syn_tasks[MAX_SYN_TASKS];
+static int syn_task_count = 0;
+static pthread_mutex_t syn_task_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// 收包线程句柄
+static pthread_t syn_listener_thread;
+static volatile int syn_listener_running = 0;
+
 // 函数声明
 void safe_output(const char *format, ...);
 int enqueue_task(scan_task_t *task);
@@ -143,6 +155,8 @@ uint16_t checksum(void *vdata, size_t length);
 uint16_t tcp_checksum(struct ip_header *iph, struct tcp_header *tcph);
 int create_raw_socket();
 void cleanup_raw_socket();
+
+void *syn_response_listener(void *arg); // SYN响应监听线程
 
 // IP字符串转uint32
 uint32_t ip2int(const char *ip)
@@ -492,6 +506,21 @@ port_status_t scan_port_syn_scan(scan_task_t *task)
 
     memset(packet, 0, PACKET_SIZE);
 
+    // 获取本地IP地址
+    struct sockaddr_in local_addr;
+    socklen_t addr_len = sizeof(local_addr);
+    int temp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in remote;
+    memset(&remote, 0, sizeof(remote));
+    remote.sin_family = AF_INET;
+    remote.sin_addr.s_addr = inet_addr(task->ip);
+    remote.sin_port = htons(53); // 使用DNS端口来确定路由
+    
+    // 连接到目标以获得本地IP
+    connect(temp_sock, (struct sockaddr*)&remote, sizeof(remote));
+    getsockname(temp_sock, (struct sockaddr*)&local_addr, &addr_len);
+    close(temp_sock);
+
     // 填充IP头
     iph->ihl = 5;
     iph->version = 4;
@@ -502,7 +531,7 @@ port_status_t scan_port_syn_scan(scan_task_t *task)
     iph->ttl = 255;
     iph->protocol = IPPROTO_TCP;
     iph->check = 0;
-    iph->saddr = inet_addr("127.0.0.1"); // 源IP，系统会自动选择
+    iph->saddr = local_addr.sin_addr.s_addr; // 使用正确的源IP
     iph->daddr = inet_addr(task->ip);
 
     // 填充TCP头
@@ -538,18 +567,63 @@ port_status_t scan_port_syn_scan(scan_task_t *task)
         return PORT_FILTERED;
     }
 
-    if (task->debug)
+    // 记录SYN包的seq
+    task->syn_seq = tcph->seq;
+    task->status = 0; // 未判定
+
+    // 加入SYN任务列表，供收包线程判定
+    pthread_mutex_lock(&syn_task_mutex);
+    if (syn_task_count < MAX_SYN_TASKS)
     {
-        safe_output("[调试] %s:%d SYN包已发送\n", task->ip, task->port);
+        syn_tasks[syn_task_count++] = task;
+    }
+    pthread_mutex_unlock(&syn_task_mutex);
+
+    // 等待收包线程判定（此处可优化为条件变量或轮询）
+    int wait_ms = task->connect_timeout_ms;
+    int waited = 0;
+    while (waited < wait_ms)
+    {
+        if (task->status != 0)
+            break;
+        usleep(10000); // 10ms
+        waited += 10;
     }
 
-    // 等待响应（简化版，实际应该监听响应包）
-    usleep(task->connect_timeout_ms * 1000);
+    // 判定结果
+    port_status_t result;
+    if (task->status == 1)
+        result = PORT_OPEN;
+    else if (task->status == 2)
+        result = PORT_CLOSED;
+    else
+        result = PORT_FILTERED;
 
-    // 注意：这里简化了响应处理
-    // 实际应该创建一个监听套接字来捕获SYN-ACK或RST响应
-    // 为了简化，我们使用TCP连接测试来验证端口状态
-    return scan_port_tcp_connect(task);
+    // 从SYN任务列表中移除已完成的任务
+    pthread_mutex_lock(&syn_task_mutex);
+    for (int i = 0; i < syn_task_count; ++i)
+    {
+        if (syn_tasks[i] == task)
+        {
+            // 移除任务，后面的任务前移
+            for (int j = i; j < syn_task_count - 1; ++j)
+            {
+                syn_tasks[j] = syn_tasks[j + 1];
+            }
+            syn_task_count--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&syn_task_mutex);
+
+    if (task->debug)
+    {
+        const char *status_str = (result == PORT_OPEN) ? "开放" : 
+                                (result == PORT_CLOSED) ? "关闭" : "过滤";
+        safe_output("[调试] %s:%d SYN扫描结果: %s\n", task->ip, task->port, status_str);
+    }
+
+    return result;
 #endif
 }
 
@@ -980,12 +1054,20 @@ int main(int argc, char *argv[])
 
     char iplist[1024][64];
     int ipcount = 0;
-    int portlist[1024];
+    int *portlist = NULL; // 动态分配
+    int portlist_capacity = 1024;
     int portcount = 0;
     char outfile[256] = "";
     int threads = 50, connect_timeout_ms = 500, recv_timeout_ms = 2000;
     int verbose = 0, debug = 0, fast_mode = 0, quiet_mode = 0, udpxy_detect = 0;
     scan_mode_t scan_mode = SCAN_MODE_TCP_CONNECT;
+
+    // 初始化动态端口列表
+    portlist = malloc(portlist_capacity * sizeof(int));
+    if (!portlist) {
+        fprintf(stderr, "内存分配失败\n");
+        return 1;
+    }
 
     // 解析参数
     for (int i = 1; i < argc; ++i)
@@ -996,7 +1078,21 @@ int main(int argc, char *argv[])
         }
         else if (strcmp(argv[i], "-ports") == 0 && i + 1 < argc)
         {
-            portcount = parse_ports(argv[++i], portlist, 1024);
+            // 动态扩展端口列表
+            int temp_ports[65536];
+            int temp_count = parse_ports(argv[++i], temp_ports, 65536);
+            if (temp_count > portlist_capacity) {
+                portlist_capacity = temp_count + 100;
+                portlist = realloc(portlist, portlist_capacity * sizeof(int));
+                if (!portlist) {
+                    fprintf(stderr, "内存分配失败\n");
+                    return 1;
+                }
+            }
+            for (int j = 0; j < temp_count; j++) {
+                portlist[j] = temp_ports[j];
+            }
+            portcount = temp_count;
         }
         else if (strcmp(argv[i], "-out") == 0 && i + 1 < argc)
         {
@@ -1075,7 +1171,33 @@ int main(int argc, char *argv[])
     {
         int start_port = atoi(argv[2]);
         int end_port = atoi(argv[3]);
-        for (int p = start_port; p <= end_port && portcount < 1024; ++p)
+        
+        // 移除端口数量限制，支持全端口扫描
+        if (end_port > 65535) end_port = 65535;
+        if (start_port < 1) start_port = 1;
+        if (start_port > end_port) 
+        {
+            fprintf(stderr, "错误: 起始端口不能大于结束端口\n");
+            return 1;
+        }
+        
+        int total_ports = end_port - start_port + 1;
+        if (total_ports > 10000 && !quiet_mode)
+        {
+            printf("警告: 将扫描 %d 个端口，这可能需要较长时间\n", total_ports);
+        }
+        
+        // 动态分配端口列表内存
+        if (total_ports > portlist_capacity) {
+            portlist_capacity = total_ports + 100;
+            portlist = realloc(portlist, portlist_capacity * sizeof(int));
+            if (!portlist) {
+                fprintf(stderr, "内存分配失败\n");
+                return 1;
+            }
+        }
+        
+        for (int p = start_port; p <= end_port; ++p)
         {
             portlist[portcount++] = p;
         }
@@ -1111,6 +1233,12 @@ int main(int argc, char *argv[])
         if (raw_socket_fd < 0 && !quiet_mode)
         {
             printf("警告: 无法创建原始套接字，将回退到TCP连接扫描\n");
+        }
+        else
+        {
+            // 启动SYN响应监听线程
+            syn_listener_running = 1;
+            pthread_create(&syn_listener_thread, NULL, syn_response_listener, NULL);
         }
     }
 
@@ -1171,6 +1299,8 @@ int main(int argc, char *argv[])
                 task->debug = debug;
                 task->scan_mode = scan_mode;
                 task->udpxy_detect = udpxy_detect;
+                task->syn_seq = 0;      // 初始化SYN序列号
+                task->status = 0;       // 初始化状态为未判定
                 strcpy(task->outfile, outfile);
 
                 if (enqueue_task(task) == 0)
@@ -1235,6 +1365,13 @@ int main(int argc, char *argv[])
     // 清理
     shutdown_task_queue();
 
+    // 停止SYN监听线程
+    if (scan_mode == SCAN_MODE_SYN_SCAN && syn_listener_running)
+    {
+        syn_listener_running = 0;
+        pthread_join(syn_listener_thread, NULL);
+    }
+
     for (int i = 0; i < num_threads; i++)
     {
         pthread_join(worker_threads[i], NULL);
@@ -1242,6 +1379,9 @@ int main(int argc, char *argv[])
 
     cleanup_raw_socket();
     destroy_task_queue();
+    
+    // 清理动态分配的内存
+    free(portlist);
 
     if (!quiet_mode)
     {
@@ -1260,4 +1400,84 @@ int main(int argc, char *argv[])
     }
 
     return 0;
+}
+
+// SYN响应监听线程（完整实现）
+void *syn_response_listener(void *arg)
+{
+    (void)arg;
+    uint8_t buf[PACKET_SIZE];
+    struct sockaddr_in from;
+    socklen_t fromlen = sizeof(from);
+    
+    // 设置接收超时
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 100000; // 100ms
+    setsockopt(raw_socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    
+    while (syn_listener_running)
+    {
+        int len = recvfrom(raw_socket_fd, buf, PACKET_SIZE, 0, (struct sockaddr *)&from, &fromlen);
+        if (len <= 0) 
+        {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;
+            else
+                break;
+        }
+
+        // 解析IP头
+        struct ip_header *iph = (struct ip_header *)buf;
+        if (len < sizeof(struct ip_header) || iph->protocol != IPPROTO_TCP) 
+            continue;
+            
+        // 解析TCP头
+        int ip_header_len = iph->ihl * 4;
+        if (len < ip_header_len + sizeof(struct tcp_header))
+            continue;
+            
+        struct tcp_header *tcph = (struct tcp_header *)(buf + ip_header_len);
+
+        // 转换IP地址（源地址）
+        char src_ip[INET_ADDRSTRLEN];
+        struct in_addr src_addr;
+        src_addr.s_addr = iph->saddr;
+        strcpy(src_ip, inet_ntoa(src_addr));
+        
+        uint16_t src_port = ntohs(tcph->source);
+
+        // 查找匹配的SYN任务
+        pthread_mutex_lock(&syn_task_mutex);
+        for (int i = 0; i < syn_task_count; ++i)
+        {
+            scan_task_t *task = syn_tasks[i];
+            if (task->status != 0) continue; // 已判定的跳过
+            
+            // 匹配IP和端口（响应包的源=我们的目标）
+            if (strcmp(task->ip, src_ip) == 0 && task->port == src_port)
+            {
+                if (tcph->syn == 1 && tcph->ack == 1)
+                {
+                    // SYN-ACK，端口开放
+                    task->status = 1;
+                    if (task->debug)
+                    {
+                        safe_output("[调试] %s:%d 收到SYN-ACK，端口开放\n", task->ip, task->port);
+                    }
+                }
+                else if (tcph->rst == 1)
+                {
+                    // RST，端口关闭
+                    task->status = 2;
+                    if (task->debug)
+                    {
+                        safe_output("[调试] %s:%d 收到RST，端口关闭\n", task->ip, task->port);
+                    }
+                }
+            }
+        }
+        pthread_mutex_unlock(&syn_task_mutex);
+    }
+    return NULL;
 }
